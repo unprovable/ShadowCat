@@ -394,20 +394,20 @@
       </label>
     </div>
     <div class="row">
-      <button id="send-start" class="primary" type="button" disabled>Start</button>
-      <button id="send-pause" class="primary" type="button" disabled>Pause</button>
-      <button id="send-stop" class="primary" type="button" disabled>Stop</button>
-      <label title="0 = header, 1+ = data chunk number. After this frame the loop continues normally and wraps back to the header.">Start from
-        <input id="send-start-from" type="number" value="0" min="0" style="width:5em;">
-      </label>
-    </div>
-    <div class="row">
       <label title="0 = header, 1+ = data chunk number. Useful for re-sending a specific missing chunk.">Show frame
         <input id="send-show" type="number" value="1" min="0" style="width:5em;">
       </label>
       <button id="send-show-btn" class="primary" type="button" disabled>Show</button>
       <button id="send-show-prev" class="primary" type="button" disabled aria-label="Previous frame">&minus;</button>
       <button id="send-show-next" class="primary" type="button" disabled aria-label="Next frame">+</button>
+    </div>
+    <div class="row">
+      <button id="send-start" class="primary" type="button" disabled>Start</button>
+      <button id="send-pause" class="primary" type="button" disabled>Pause</button>
+      <button id="send-stop" class="primary" type="button" disabled>Stop</button>
+      <label title="0 = header, 1+ = data chunk number. After this frame the loop continues normally and wraps back to the header.">Start from
+        <input id="send-start-from" type="number" value="0" min="0" style="width:5em;">
+      </label>
     </div>
     <div id="send-error" class="error"></div>
     <div id="send-info" class="info"></div>
