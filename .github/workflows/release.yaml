@@ -1,4 +1,4 @@
-name: Deploy CV to pages
+name: Deploy to pages
 on: push
 
 jobs:
