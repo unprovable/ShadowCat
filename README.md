@@ -18,6 +18,31 @@ A fully offline, single-file HTML page for moving data between two devices via Q
 - Base64 alphabet has no `|`, so parsing is just `split('|')`.
 - Receiver tracks chunks by index, ignores duplicates, dedupes header by CRC.
 
+See [SPEC.md](SPEC.md) for the full wire format, frame diagrams, and
+invariants. A reference encoder and decoder live in [`tools/`](tools/):
+
+```
+pip install qrcode[pil] pyzbar pillow opencv-python
+python tools/qrx1_encode.py myfile.bin --out frames/
+python tools/qrx1_decode.py frames/ -o out/
+```
+
+## Tests
+
+Both sides assert against a shared golden fixture (known input bytes → known
+CRC and header). If the JS or Python implementation drifts from the spec,
+its tests break.
+
+```
+# Python — pytest, zero deps; the optional QR-image roundtrip is skipped
+# unless qrcode/pyzbar/PIL are installed.
+python -m pytest tests/test_qrx1.py
+
+# HTML — Node's built-in runner; extracts protocol helpers straight out of
+# shadowcat.html and exercises them in a vm. No npm install needed.
+node --test tests/test_shadowcat.mjs
+```
+
 ## Practical notes for old phones
 
 - Camera needs HTTPS or localhost — `file://` won't grant `getUserMedia` permission. Serve with `python3 -m http.server 8000` and visit `http://<your-laptop-ip>:8000/qrcode.html` over the local network. iOS Safari additionally requires HTTPS for cross-device access — for a LAN setup, `caddy` or a self-signed cert helps.
