@@ -1,3 +1,5 @@
+[![tests](https://github.com/unprovable/ShadowCat/actions/workflows/tests.yml/badge.svg)](https://github.com/unprovable/ShadowCat/actions/workflows/tests.yml) 
+
 # ShadowCat
 
 A fully offline, single-file HTML page for moving data between two devices via QR codes — intended for old phones whose radios (BLE, NFC, etc.) are dead but whose cameras and browsers still work.
