@@ -11,6 +11,7 @@ The QR-rendering roundtrip tests are skipped automatically if the
 from __future__ import annotations
 
 import base64
+import gzip
 import random
 from pathlib import Path
 
@@ -29,7 +30,11 @@ GOLDEN_CRC = "bfe4986e"
 GOLDEN_FILENAME = "hello.txt"
 GOLDEN_CHUNK = 100
 GOLDEN_TOTAL = 12  # ceil(base64_len(900) / 100) == ceil(1200 / 100)
-GOLDEN_HEADER = f"QRX1|H|{GOLDEN_TOTAL}|{GOLDEN_FILENAME}|{len(GOLDEN_BYTES)}|{GOLDEN_CRC}"
+GOLDEN_FLAGS = ""  # uncompressed golden header carries empty flags
+GOLDEN_HEADER = (
+    f"QRX1|H|{GOLDEN_TOTAL}|{GOLDEN_FLAGS}|{GOLDEN_FILENAME}|"
+    f"{len(GOLDEN_BYTES)}|{GOLDEN_CRC}"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -95,7 +100,7 @@ class TestBuildFrames:
     def test_empty_file_still_has_one_data_chunk(self):
         frames = build_frames(b"", "empty.bin", 100)
         assert len(frames) == 2
-        assert frames[0] == "QRX1|H|1|empty.bin|0|00000000"
+        assert frames[0] == "QRX1|H|1||empty.bin|0|00000000"
         assert frames[1] == "QRX1|D|1|"
 
     def test_rejects_filename_with_pipe(self):
@@ -109,6 +114,69 @@ class TestBuildFrames:
 
 
 # ---------------------------------------------------------------------------
+# build_frames with compress=True
+# ---------------------------------------------------------------------------
+
+class TestBuildFramesCompressed:
+    # 5000-byte payload of repeating ASCII — gzip should shrink this hard
+    COMPRESSIBLE = (b"The quick brown fox jumps over the lazy dog.\n" * 120)[:5000]
+    COMPRESSIBLE_CRC = crc32hex(COMPRESSIBLE)
+
+    def test_compress_emits_gz_flag(self):
+        frames = build_frames(self.COMPRESSIBLE, "fox.txt", 200, compress=True)
+        parts = frames[0].split("|")
+        assert parts[3] == "gz"
+
+    def test_compress_uses_compressed_size(self):
+        frames = build_frames(self.COMPRESSIBLE, "fox.txt", 200, compress=True)
+        parts = frames[0].split("|")
+        wire_size = int(parts[5])
+        assert wire_size < len(self.COMPRESSIBLE), (
+            f"expected wire size to shrink, got {wire_size} vs {len(self.COMPRESSIBLE)}"
+        )
+
+    def test_compress_crc_is_over_original_bytes(self):
+        frames = build_frames(self.COMPRESSIBLE, "fox.txt", 200, compress=True)
+        parts = frames[0].split("|")
+        assert parts[6] == self.COMPRESSIBLE_CRC
+
+    def test_compress_keeps_original_filename(self):
+        frames = build_frames(self.COMPRESSIBLE, "fox.txt", 200, compress=True)
+        parts = frames[0].split("|")
+        assert parts[4] == "fox.txt"
+
+    def test_data_payload_is_base64_of_gzipped_bytes(self):
+        frames = build_frames(self.COMPRESSIBLE, "fox.txt", 2000, compress=True)
+        # The compressible fixture gzips down to ~100 bytes (base64 ~136 chars),
+        # well inside a single chunk of 2000.
+        assert len(frames) == 2
+        payload_b64 = frames[1].split("|", 3)[3]
+        payload = base64.b64decode(payload_b64)
+        # And that decompresses back to the original.
+        assert gzip.decompress(payload) == self.COMPRESSIBLE
+
+    def test_compress_falls_back_when_gzip_is_larger(self):
+        # Tiny payload — gzip header alone exceeds it. Auto-fallback must kick in.
+        tiny = b"hi"
+        frames = build_frames(tiny, "hi.txt", 100, compress=True)
+        parts = frames[0].split("|")
+        assert parts[3] == "", f"expected empty flags on fallback, got {parts[3]!r}"
+        assert int(parts[5]) == len(tiny)
+
+    def test_compress_on_empty_falls_back(self):
+        frames = build_frames(b"", "empty.bin", 100, compress=True)
+        parts = frames[0].split("|")
+        assert parts[3] == ""
+        assert int(parts[5]) == 0
+
+    def test_compress_flag_off_does_not_compress(self):
+        frames = build_frames(self.COMPRESSIBLE, "fox.txt", 200, compress=False)
+        parts = frames[0].split("|")
+        assert parts[3] == ""
+        assert int(parts[5]) == len(self.COMPRESSIBLE)
+
+
+# ---------------------------------------------------------------------------
 # parse_frame
 # ---------------------------------------------------------------------------
 
@@ -116,7 +184,14 @@ class TestParseFrame:
     def test_valid_header(self):
         kind, h = parse_frame(GOLDEN_HEADER)
         assert kind == "H"
-        assert h == Header(GOLDEN_TOTAL, GOLDEN_FILENAME, len(GOLDEN_BYTES), GOLDEN_CRC)
+        assert h == Header(GOLDEN_TOTAL, "", GOLDEN_FILENAME, len(GOLDEN_BYTES), GOLDEN_CRC)
+
+    def test_valid_header_with_gz_flag(self):
+        kind, h = parse_frame("QRX1|H|3|gz|file.bin|42|deadbeef")
+        assert kind == "H"
+        assert h.flags == "gz"
+        assert h.has_flag("gz")
+        assert not h.has_flag("xz")
 
     def test_valid_data(self):
         kind, idx, data = parse_frame("QRX1|D|7|SGVsbG8=")
@@ -125,7 +200,7 @@ class TestParseFrame:
         assert data == "SGVsbG8="
 
     def test_lowercases_crc(self):
-        _, h = parse_frame("QRX1|H|1|x|0|ABCDEF12")
+        _, h = parse_frame("QRX1|H|1||x|0|ABCDEF12")
         assert h.crc == "abcdef12"
 
     def test_data_chunk_can_be_empty(self):
@@ -137,12 +212,14 @@ class TestParseFrame:
         [
             "",
             "garbage",
-            "QRX2|H|1|x|0|00000000",  # wrong version tag
-            "qrx1|H|1|x|0|00000000",  # wrong case
-            "QRX1|X|1|x|0|00000000",  # unknown type
-            "QRX1|H|1|x|0",            # truncated header
-            "QRX1|D|1",                # truncated data
-            "QRX1|H|notanumber|x|0|00000000",
+            "QRX2|H|1||x|0|00000000",   # wrong version tag
+            "qrx1|H|1||x|0|00000000",   # wrong case
+            "QRX1|X|1||x|0|00000000",   # unknown type
+            "QRX1|H|1|x|0|00000000",    # old (no-flags) format — now invalid
+            "QRX1|H|1||x|0",            # truncated header
+            "QRX1|D|1",                 # truncated data
+            "QRX1|H|notanumber||x|0|00000000",
+            "QRX1|H|1||x|notanumber|00000000",
             "QRX1|D|notanumber|payload",
         ],
     )
@@ -230,7 +307,7 @@ class TestReceiver:
         r.ingest(frames[0])
         r.ingest(frames[1])
         r.ingest("not a qrx1 frame at all")
-        r.ingest("QRX2|H|1|x|0|00000000")
+        r.ingest("QRX2|H|1||x|0|00000000")
         assert r.count == 1
         assert r.header is not None
 
@@ -239,7 +316,7 @@ class TestReceiver:
         r.ingest(GOLDEN_HEADER)
         r.ingest("QRX1|D|1|AAAA")
         # different CRC and different file: receiver should reset
-        new_header = "QRX1|H|3|other.bin|10|deadbeef"
+        new_header = "QRX1|H|3||other.bin|10|deadbeef"
         r.ingest(new_header)
         assert r.header is not None
         assert r.header.crc == "deadbeef"
@@ -271,6 +348,56 @@ class TestReceiver:
         assert 3 not in miss  # frames[3] is data idx 3
         assert 7 not in miss
         assert sorted(miss + [3, 7]) == list(range(1, GOLDEN_TOTAL + 1))
+
+
+# ---------------------------------------------------------------------------
+# Receiver — compression
+# ---------------------------------------------------------------------------
+
+class TestReceiverCompression:
+    PAYLOAD = (b"compress me " * 500)
+    PAYLOAD_CRC = crc32hex(PAYLOAD)
+
+    def test_gz_roundtrip(self):
+        frames = build_frames(self.PAYLOAD, "blob.bin", 500, compress=True)
+        r = Receiver()
+        for f in frames:
+            r.ingest(f)
+        assert r.assemble() == self.PAYLOAD
+
+    def test_gz_header_carries_flag_and_compressed_size(self):
+        frames = build_frames(self.PAYLOAD, "blob.bin", 500, compress=True)
+        _, h = parse_frame(frames[0])
+        assert h.has_flag("gz")
+        assert h.size < len(self.PAYLOAD)
+        assert h.crc == self.PAYLOAD_CRC  # CRC is over original
+        assert h.name == "blob.bin"       # filename unchanged
+
+    def test_unknown_flag_is_rejected(self):
+        # craft a header that names a flag we don't know
+        payload = b"x" * 30
+        b64 = base64.b64encode(payload).decode()
+        header = f"QRX1|H|1|xz|x.bin|{len(payload)}|{crc32hex(payload)}"
+        data = f"QRX1|D|1|{b64}"
+        r = Receiver()
+        r.ingest(header)
+        r.ingest(data)
+        with pytest.raises(ValueError, match="unknown header flags"):
+            r.assemble()
+
+    def test_corrupt_gzip_is_caught(self):
+        # claim gz but ship non-gzip bytes — assemble must raise, not return garbage
+        payload = b"this is not gzip data"
+        b64 = base64.b64encode(payload).decode()
+        # Use a plausible-looking CRC (over what would be the "decompressed" bytes
+        # — we never get there, the gunzip blows up first).
+        header = f"QRX1|H|1|gz|x.bin|{len(payload)}|deadbeef"
+        data = f"QRX1|D|1|{b64}"
+        r = Receiver()
+        r.ingest(header)
+        r.ingest(data)
+        with pytest.raises(ValueError, match="gzip decompression failed"):
+            r.assemble()
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +441,45 @@ def test_full_qr_image_roundtrip(tmp_path: Path):
 
     r = Receiver()
     for path in sorted(tmp_path.glob("f_*.png")):
+        with Image.open(path) as img:
+            for sym in zbar_decode(img):
+                r.ingest(sym.data.decode("utf-8"))
+
+    assert r.assemble() == raw
+
+
+@pytest.mark.skipif(
+    not _have_qr_stack(),
+    reason="needs qrcode + pyzbar + PIL (and system zbar) installed",
+)
+def test_full_qr_image_roundtrip_gzipped(tmp_path: Path):
+    """Same as above but with compression=True; verifies that the gzip flag
+    survives a real QR render + scan pass."""
+    import qrcode
+    from PIL import Image
+    from pyzbar.pyzbar import decode as zbar_decode
+
+    raw = (b"The quick brown fox jumps over the lazy dog.\n" * 30)
+    frames = build_frames(raw, "fox.txt", 200, compress=True)
+
+    # Sanity-check that compression actually kicked in for this fixture
+    _, h = parse_frame(frames[0])
+    assert h.has_flag("gz")
+
+    for i, text in enumerate(frames):
+        qr = qrcode.QRCode(
+            error_correction=qrcode.constants.ERROR_CORRECT_M,
+            box_size=6,
+            border=4,
+        )
+        qr.add_data(text)
+        qr.make(fit=True)
+        qr.make_image(fill_color="black", back_color="white").save(
+            tmp_path / f"g_{i:04d}.png"
+        )
+
+    r = Receiver()
+    for path in sorted(tmp_path.glob("g_*.png")):
         with Image.open(path) as img:
             for sym in zbar_decode(img):
                 r.ingest(sym.data.decode("utf-8"))

@@ -107,6 +107,12 @@ def main() -> int:
         action="store_true",
         help="also print the raw QRX1 text of each frame to stdout",
     )
+    p.add_argument(
+        "--gzip",
+        action="store_true",
+        help="gzip the payload before chunking; falls back to uncompressed "
+        "automatically if the gzipped size is not smaller",
+    )
     args = p.parse_args()
 
     if not args.file.is_file():
@@ -115,7 +121,7 @@ def main() -> int:
 
     raw = args.file.read_bytes()
     try:
-        frames = build_frames(raw, args.file.name, args.chunk)
+        frames = build_frames(raw, args.file.name, args.chunk, compress=args.gzip)
     except ValueError as e:
         sys.stderr.write(f"error: {e}\n")
         return 1
@@ -123,8 +129,20 @@ def main() -> int:
     args.out.mkdir(parents=True, exist_ok=True)
     ecc = ECC_MAP[args.ecc]
 
+    header_parts = frames[0].split("|")
+    flags = header_parts[3]
+    wire_size = int(header_parts[5])
+    crc = header_parts[6]
+    if args.gzip and flags == "gz":
+        pct = 100 * (1 - wire_size / max(1, len(raw)))
+        compression_note = f", gzipped {len(raw)} -> {wire_size} bytes ({pct:.1f}% smaller)"
+    elif args.gzip:
+        compression_note = f", gzip skipped (would have grown the payload)"
+    else:
+        compression_note = ""
+
     print(
-        f"{args.file.name}: {len(raw)} bytes, crc32={frames[0].split('|')[5]}, "
+        f"{args.file.name}: {len(raw)} bytes{compression_note}, crc32={crc}, "
         f"{len(frames) - 1} data chunks, {len(frames)} total frames "
         f"(chunk={args.chunk} chars, ecc={args.ecc})"
     )

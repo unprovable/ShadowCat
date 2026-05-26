@@ -210,8 +210,15 @@ def main() -> int:
         return 1
 
     out_path.write_bytes(raw)
+    flag_note = f", flags={recv.header.flags!r}" if recv.header.flags else ""
+    wire_note = (
+        f" (decompressed from {recv.header.size} wire bytes)"
+        if recv.header.has_flag("gz")
+        else ""
+    )
     print(
-        f"OK: wrote {out_path} ({len(raw)} bytes, crc32={recv.header.crc})"
+        f"OK: wrote {out_path} ({len(raw)} bytes{wire_note}, "
+        f"crc32={recv.header.crc}{flag_note})"
     )
     return 0
 
