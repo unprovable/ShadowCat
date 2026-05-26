@@ -49,3 +49,9 @@ node --test tests/test_shadowcat.mjs
 - If render fails on a frame ("code length overflow"), drop chunk size or drop ECC level.
 - 500 chars × 3 fps ≈ 1.1 KB/s base64 ≈ 0.83 KB/s raw. A 100 KB file is roughly 2 minutes per loop; receiver typically needs 1-2 loops.
 - If old devices struggle to decode: lower FPS, raise ECC to Q, shrink chunk to ~300 chars — produces smaller, less dense QRs.
+
+## Related
+
+Doing data transfer with QR Codes is a well trodden idea. Here are some references of other projects that may be useful for erudition or expansion:
+
+* IP-Over-QR Codes - https://hackaday.com/2016/11/22/ip-over-qr-codes/ 
