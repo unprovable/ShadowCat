@@ -47,17 +47,32 @@ Every QR encodes a single UTF-8 text string of one of two types.
 ### 2.1 Header frame (type `H`)
 
 ```
-+--------+---+--------+-----------+------------+-------------+
-| "QRX1" | H | total  | filename  | sizeBytes  | crc32hex    |
-+--------+---+--------+-----------+------------+-------------+
-   ^      ^     ^          ^           ^             ^
-   |      |     |          |           |             |
-   |      |     |          |           |             8-char lowercase hex CRC32
-   |      |     |          |           |             of the raw file bytes
-   |      |     |          |           |
-   |      |     |          |           total raw file size in bytes (decimal)
-   |      |     |          |
-   |      |     |          original filename, no '|' character allowed
++--------+---+--------+--------+-----------+------------+-------------+
+| "QRX1" | H | total  | flags  | filename  | sizeBytes  | crc32hex    |
++--------+---+--------+--------+-----------+------------+-------------+
+   ^      ^     ^        ^         ^           ^             ^
+   |      |     |        |         |           |             |
+   |      |     |        |         |           |             8-char lowercase hex CRC32
+   |      |     |        |         |           |             of the ORIGINAL (decompressed)
+   |      |     |        |         |           |             file bytes
+   |      |     |        |         |           |
+   |      |     |        |         |           on-wire payload size in bytes (decimal).
+   |      |     |        |         |           Equals the original size when no
+   |      |     |        |         |           transform flag is set; equals the gzipped
+   |      |     |        |         |           size when `gz` is set.
+   |      |     |        |         |
+   |      |     |        |         original filename, no '|' character allowed.
+   |      |     |        |         Filename is NOT modified by transform flags —
+   |      |     |        |         a gzipped `report.pdf` is still announced as
+   |      |     |        |         `report.pdf`, and the receiver writes it under
+   |      |     |        |         that name post-decompression.
+   |      |     |        |
+   |      |     |        comma-separated transform flags, empty by default.
+   |      |     |        Defined flags (this version):
+   |      |     |          gz  — payload is gzipped (RFC 1952). Receiver must
+   |      |     |                gunzip before the CRC check.
+   |      |     |        Unknown flags MUST cause the receiver to refuse the
+   |      |     |        payload rather than hand the user corrupt bytes.
    |      |     |
    |      |     number of data chunks that follow (decimal, >= 1)
    |      |
@@ -66,10 +81,16 @@ Every QR encodes a single UTF-8 text string of one of two types.
    protocol version tag, literal "QRX1"
 ```
 
-Literal example:
+Literal examples:
 
 ```
-QRX1|H|14|hello.txt|6713|9a3f0c21
+# Uncompressed: empty flags field, sizeBytes is the file size, CRC is over
+# those same bytes.
+QRX1|H|14||hello.txt|6713|9a3f0c21
+
+# Gzipped: gz flag set, sizeBytes is the gzipped wire size, CRC is still
+# over the original (decompressed) file bytes.
+QRX1|H|3|gz|hello.txt|412|9a3f0c21
 ```
 
 ### 2.2 Data frame (type `D`)
@@ -111,16 +132,31 @@ SHOULD reject or sanitize filenames containing `|`.
    raw file bytes
         |
         |  1. compute crc32hex = lowercase hex CRC32 (IEEE 802.3 poly 0xEDB88320,
-        |     init 0xFFFFFFFF, xor-out 0xFFFFFFFF) of the raw bytes
+        |     init 0xFFFFFFFF, xor-out 0xFFFFFFFF) of the raw bytes.
+        |     This CRC is always over the ORIGINAL bytes, before any transform.
         v
    crc32hex                              raw file bytes
                                               |
-                                              |  2. base64-encode (standard,
+                                              |  2. (optional) transform pipeline.
+                                              |     If compression is requested,
+                                              |     gzip the raw bytes (RFC 1952).
+                                              |     Compare len(gzipped) vs len(raw):
+                                              |       if smaller -> payload = gzipped,
+                                              |                     flags = "gz"
+                                              |       else      -> payload = raw,
+                                              |                     flags = ""
+                                              |     This auto-fallback guarantees the
+                                              |     wire size never grows because the
+                                              |     user opted into compression.
+                                              v
+                                         payload bytes  P    (size = sizeBytes)
+                                              |
+                                              |  3. base64-encode (standard,
                                               |     with '=' padding)
                                               v
                                          base64 string  S
                                               |
-                                              |  3. split S into fixed-length
+                                              |  4. split S into fixed-length
                                               |     character slices of length
                                               |     chunkLen (default 500;
                                               |     allowed range 50..2000 in
@@ -128,14 +164,14 @@ SHOULD reject or sanitize filenames containing `|`.
                                               v
                           slices: S[0..L], S[L..2L], ..., last slice may be shorter
                                               |
-                                              |  4. total = number of slices
+                                              |  5. total = number of slices
                                               v
-        +-----------------------------+   +------------------------------------+
-        | header = QRX1|H|<total>|... |   | data_i = QRX1|D|<i>|<slice_{i-1}>  |
-        +-----------------------------+   +------------------------------------+
-                       \                            /
-                        \                          /
-                         v                        v
+        +---------------------------------------+   +------------------------------------+
+        | header = QRX1|H|<total>|<flags>|...   |   | data_i = QRX1|D|<i>|<slice_{i-1}>  |
+        +---------------------------------------+   +------------------------------------+
+                       \                                       /
+                        \                                     /
+                         v                                   v
                           frames = [header, data_1, data_2, ..., data_total]
                                               |
                                               v
@@ -147,6 +183,9 @@ Notes:
   chars ≈ 375 raw bytes per frame.
 - The header is re-shown once per loop, so a receiver that misses the very
   first frame still gets it on the next pass.
+- The transform pipeline is open-ended: future flags may add encryption,
+  alternative compression, etc. Each transform layer documents its semantics
+  here; receivers refuse unknown flags.
 
 ---
 
@@ -156,7 +195,7 @@ Notes:
    QR scan tick
         |
         v
-   text  ----> parseFrame(text) ----> {type:'H', total, name, size, crc}
+   text  ----> parseFrame(text) ----> {type:'H', total, flags, name, size, crc}
                        |              {type:'D', idx, data}
                        |              null   (not a QRX1 frame; ignored)
                        v
@@ -164,6 +203,14 @@ Notes:
               | Header arrives |
               +----------------+
                        |
+        any flag in `flags` is unknown?
+                       |
+                yes -->+--> surface an error; do not start collecting.
+                       |    (Receiver MUST refuse rather than silently
+                       |    dropping the flag and yielding wrong bytes.)
+                       |
+                no  -->+--> proceed.
+
         new header (different crc OR different total)?
                        |
                 yes -->+--> reset state:
@@ -181,33 +228,45 @@ Notes:
               if no header yet            -> drop (cannot place chunk)
               if idx < 1 or idx > total   -> drop (out of range)
               if recvChunks[idx-1] set    -> drop (duplicate)
-              else                         -> store, recvCount += 1
+              else                        -> store, recvCount += 1
 
               when recvCount == total:
-                  reassembled = base64decode(concat(recvChunks))
-                  assert len(reassembled) == recvHeader.size
+                  payload     = base64decode(concat(recvChunks))
+                  assert len(payload) == recvHeader.size
+
+                  if 'gz' in flags:
+                      reassembled = gunzip(payload)
+                  else:
+                      reassembled = payload
+
                   assert crc32hex(reassembled) == recvHeader.crc
-                  emit file
+                  emit file under recvHeader.name
 ```
 
 ---
 
 ## 5. Invariants & error handling
 
-| # | Invariant                                                                              |
-|---|----------------------------------------------------------------------------------------|
-| 1 | A frame begins with the literal ASCII prefix `QRX1|`. Anything else is ignored.        |
-| 2 | The second field is either `H` or `D`. Other values are ignored.                       |
-| 3 | `total` (header) and `idx` (data) are decimal integers with no leading sign.           |
-| 4 | `idx` is 1-indexed and bounded by `1 <= idx <= total`.                                 |
-| 5 | `crc32hex` is exactly 8 lowercase hex characters.                                      |
-| 6 | The base64 alphabet used is the standard one (A-Z, a-z, 0-9, `+`, `/`, `=`). No `|`.   |
-| 7 | A new header with a CRC or total different from the current one resets receiver state. |
-| 8 | Duplicate data frames (same `idx`) MUST be ignored, not overwritten.                   |
+| #  | Invariant                                                                              |
+|----|----------------------------------------------------------------------------------------|
+| 1  | A frame begins with the literal ASCII prefix `QRX1|`. Anything else is ignored.        |
+| 2  | The second field is either `H` or `D`. Other values are ignored.                       |
+| 3  | A header frame has exactly 7 `|`-separated fields. Anything shorter is malformed.      |
+| 4  | `total` (header) and `idx` (data) are decimal integers with no leading sign.           |
+| 5  | `idx` is 1-indexed and bounded by `1 <= idx <= total`.                                 |
+| 6  | `flags` is comma-separated, may be empty. Empty list means no transforms applied.      |
+| 7  | `sizeBytes` is the on-wire payload size — equals the gzipped size when `gz` is set.    |
+| 8  | `crc32hex` is exactly 8 lowercase hex characters, always over the **original** bytes.  |
+| 9  | The base64 alphabet used is the standard one (A-Z, a-z, 0-9, `+`, `/`, `=`). No `|`.   |
+| 10 | A new header with a CRC or total different from the current one resets receiver state. |
+| 11 | Duplicate data frames (same `idx`) MUST be ignored, not overwritten.                   |
+| 12 | A header carrying an unknown flag MUST be refused; the receiver does not collect data. |
 
 If the final CRC check fails the receiver should surface an error rather than
 silently writing a corrupt file. The reference HTML shows a red status banner
-in that case.
+in that case. Likewise, a `gz` decompression failure (corrupt gzip bytes,
+truncation) is a hard error, not a fallback to raw payload — bytes that don't
+decompress are bytes the user shouldn't be handed.
 
 ---
 
@@ -232,3 +291,15 @@ in that case.
 The literal prefix `QRX1` is the protocol version. A future incompatible
 version would use a different tag (e.g. `QRX2`) and receivers should ignore
 frames whose prefix they do not recognize.
+
+Forward-compatible additions inside QRX1 happen through the `flags` field:
+new transform layers can be defined (e.g. an additional compressor, or an
+encryption layer) without bumping the prefix, since old receivers will see
+the unknown flag and refuse to decode rather than producing garbage. This
+spec defines `gz` (gzip, RFC 1952). All other flag tokens are reserved.
+
+> **Note on the `flags` field addition.** Prior to this revision, QRX1
+> headers carried 6 fields (no flags slot). The `flags` field is positioned
+> between `total` and `filename`, so headers written by the older format
+> will fail the 7-field length check (Invariant 3) and be rejected. There
+> are no field-layout differences within data (type `D`) frames.
