@@ -10,17 +10,19 @@ Click here to use it: https://shadowcat.online/
 
 - **Generate** — encode text into a single QR code.
 - **Scan** — decode a single QR via the camera.
-- **Send file** — pick a file, choose chunk size / FPS / ECC, hit Start. Cycles through `[header, chunk1…chunkN]` forever at the chosen FPS. Pause / Resume / Stop.
+- **Send file** — pick a file, choose chunk size / FPS / ECC, optionally **Compress (gzip)**, hit Start. Compression auto-falls-back when the gzipped payload isn't smaller (e.g. for PDF/JPG/MP4). Cycles through `[header, chunk1…chunkN]` forever at the chosen FPS. Pause / Resume / Stop.
 - **Start from** — begin the loop at a chosen frame index; it then continues forward and wraps back to the header normally.
 - **Show frame** + **Show** / **−** / **+** — display exactly one frame static, for resending a specific missing chunk. The number matches the chunk index shown in the receiver's missing-chunks grid (0 = header).
 - **Receive file** — start the camera and point at the sender. Header autodetects, progress bar fills in, missing-chunks grid shows which ones haven't arrived yet. When complete, the file's CRC is verified and a Download button appears.
 
 ## Protocol
 
-- Header: `QRX1|H|<total>|<filename>|<sizeBytes>|<crc32hex>`
+- Header: `QRX1|H|<total>|<flags>|<filename>|<sizeBytes>|<crc32hex>`
 - Data: `QRX1|D|<idx>|<base64chunk>` (1-indexed)
+- `<flags>` is a comma-separated list, empty by default. Defined flags: `gz` = payload is gzipped.
+- `<sizeBytes>` is the on-wire size (gzipped when `gz` is set); `<crc32hex>` is always over the original bytes.
 - Base64 alphabet has no `|`, so parsing is just `split('|')`.
-- Receiver tracks chunks by index, ignores duplicates, dedupes header by CRC.
+- Receiver tracks chunks by index, ignores duplicates, dedupes header by CRC. Unknown flags are refused.
 
 See [SPEC.md](SPEC.md) for the full wire format, frame diagrams, and
 invariants. A reference encoder and decoder live in [`tools/`](tools/):
@@ -28,6 +30,7 @@ invariants. A reference encoder and decoder live in [`tools/`](tools/):
 ```
 pip install qrcode[pil] pyzbar pillow opencv-python
 python tools/qrx1_encode.py myfile.bin --out frames/
+python tools/qrx1_encode.py myfile.bin --gzip --out frames/   # gzip the payload
 python tools/qrx1_decode.py frames/ -o out/
 ```
 

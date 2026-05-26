@@ -9,8 +9,15 @@ QR rendering and image/video input on top of these primitives.
 from __future__ import annotations
 
 import base64
+import gzip
 import zlib
 from typing import Optional
+
+
+# Flags that this implementation knows how to interpret. A receiver MUST
+# refuse to decode a payload that carries an unknown flag — silently
+# ignoring it would risk handing the user corrupt bytes.
+KNOWN_FLAGS = frozenset({"gz"})
 
 
 def crc32hex(data: bytes) -> str:
@@ -18,8 +25,26 @@ def crc32hex(data: bytes) -> str:
     return f"{zlib.crc32(data) & 0xFFFFFFFF:08x}"
 
 
-def build_frames(raw: bytes, filename: str, chunk_len: int = 500) -> list[str]:
-    """Return [header, data_1, data_2, ...] for `raw` bytes."""
+def _parse_flags(flags: str) -> list[str]:
+    """Split a flags field into a list of non-empty tokens."""
+    return [t for t in flags.split(",") if t]
+
+
+def build_frames(
+    raw: bytes,
+    filename: str,
+    chunk_len: int = 500,
+    *,
+    compress: bool = False,
+) -> list[str]:
+    """Return [header, data_1, data_2, ...] for `raw` bytes.
+
+    If `compress=True`, gzip the payload first; if the gzipped result is not
+    smaller than the original, fall back to the raw bytes with empty flags
+    (so the receiver never gets a transfer that's bigger than it had to be).
+    The CRC is always computed over the *original* (decompressed) bytes, and
+    the filename is left untouched — no '.gz' suffix.
+    """
     if "|" in filename:
         raise ValueError(
             f"filename contains '|' which is the QRX1 field separator: {filename!r}"
@@ -27,11 +52,20 @@ def build_frames(raw: bytes, filename: str, chunk_len: int = 500) -> list[str]:
     if not (50 <= chunk_len <= 2000):
         raise ValueError(f"chunk size must be in [50, 2000], got {chunk_len}")
 
-    b64 = base64.b64encode(raw).decode("ascii")
-    total = max(1, (len(b64) + chunk_len - 1) // chunk_len)
     crc = crc32hex(raw)
 
-    header = f"QRX1|H|{total}|{filename}|{len(raw)}|{crc}"
+    payload = raw
+    flags = ""
+    if compress:
+        gz = gzip.compress(raw, compresslevel=9, mtime=0)
+        if len(gz) < len(raw):
+            payload = gz
+            flags = "gz"
+
+    b64 = base64.b64encode(payload).decode("ascii")
+    total = max(1, (len(b64) + chunk_len - 1) // chunk_len)
+
+    header = f"QRX1|H|{total}|{flags}|{filename}|{len(payload)}|{crc}"
     frames = [header]
     for i in range(total):
         frames.append(f"QRX1|D|{i + 1}|{b64[i * chunk_len : (i + 1) * chunk_len]}")
@@ -39,28 +73,33 @@ def build_frames(raw: bytes, filename: str, chunk_len: int = 500) -> list[str]:
 
 
 class Header:
-    __slots__ = ("total", "name", "size", "crc")
+    __slots__ = ("total", "flags", "name", "size", "crc")
 
-    def __init__(self, total: int, name: str, size: int, crc: str):
+    def __init__(self, total: int, flags: str, name: str, size: int, crc: str):
         self.total = total
+        self.flags = flags
         self.name = name
         self.size = size
         self.crc = crc
 
     def __repr__(self) -> str:
         return (
-            f"Header(total={self.total!r}, name={self.name!r}, "
-            f"size={self.size!r}, crc={self.crc!r})"
+            f"Header(total={self.total!r}, flags={self.flags!r}, "
+            f"name={self.name!r}, size={self.size!r}, crc={self.crc!r})"
         )
 
     def __eq__(self, other: object) -> bool:
         return (
             isinstance(other, Header)
             and self.total == other.total
+            and self.flags == other.flags
             and self.name == other.name
             and self.size == other.size
             and self.crc == other.crc
         )
+
+    def has_flag(self, name: str) -> bool:
+        return name in _parse_flags(self.flags)
 
 
 def parse_frame(text: str):
@@ -69,10 +108,16 @@ def parse_frame(text: str):
         return None
     parts = text.split("|")
     try:
-        if parts[1] == "H" and len(parts) >= 6:
+        if parts[1] == "H" and len(parts) >= 7:
             return (
                 "H",
-                Header(int(parts[2]), parts[3], int(parts[4]), parts[5].lower()),
+                Header(
+                    int(parts[2]),
+                    parts[3],
+                    parts[4],
+                    int(parts[5]),
+                    parts[6].lower(),
+                ),
             )
         if parts[1] == "D" and len(parts) >= 4:
             return ("D", int(parts[2]), parts[3])
@@ -108,8 +153,9 @@ class Receiver:
                 self.chunks = [None] * h.total
                 self.count = 0
                 if self.verbose:
+                    flag_str = f" flags={h.flags!r}" if h.flags else ""
                     print(
-                        f"[header] name={h.name!r} size={h.size} "
+                        f"[header] name={h.name!r} size={h.size}{flag_str} "
                         f"chunks={h.total} crc={h.crc}"
                     )
             return self._complete()
@@ -139,12 +185,31 @@ class Receiver:
     def assemble(self) -> bytes:
         if self.header is None or not self._complete():
             raise ValueError("receiver is not complete")
-        b64 = "".join(self.chunks)  # type: ignore[arg-type]
-        raw = base64.b64decode(b64)
-        if len(raw) != self.header.size:
+
+        flags = _parse_flags(self.header.flags)
+        unknown = [f for f in flags if f not in KNOWN_FLAGS]
+        if unknown:
             raise ValueError(
-                f"size mismatch: got {len(raw)} bytes, header says {self.header.size}"
+                f"unknown header flags: {','.join(unknown)} "
+                f"(this build knows only: {','.join(sorted(KNOWN_FLAGS))})"
             )
+
+        b64 = "".join(self.chunks)  # type: ignore[arg-type]
+        payload = base64.b64decode(b64)
+        if len(payload) != self.header.size:
+            raise ValueError(
+                f"size mismatch: got {len(payload)} bytes, "
+                f"header says {self.header.size}"
+            )
+
+        if "gz" in flags:
+            try:
+                raw = gzip.decompress(payload)
+            except (OSError, EOFError, zlib.error) as e:
+                raise ValueError(f"gzip decompression failed: {e}") from e
+        else:
+            raw = payload
+
         got = crc32hex(raw)
         if got != self.header.crc:
             raise ValueError(

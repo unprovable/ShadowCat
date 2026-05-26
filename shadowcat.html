@@ -309,8 +309,10 @@
 
         <h3>Protocol</h3>
         <ul>
-          <li>Header: <span class="mono">QRX1|H|&lt;total&gt;|&lt;filename&gt;|&lt;sizeBytes&gt;|&lt;crc32hex&gt;</span></li>
+          <li>Header: <span class="mono">QRX1|H|&lt;total&gt;|&lt;flags&gt;|&lt;filename&gt;|&lt;sizeBytes&gt;|&lt;crc32hex&gt;</span></li>
           <li>Data: <span class="mono">QRX1|D|&lt;idx&gt;|&lt;base64chunk&gt;</span> (1-indexed)</li>
+          <li><span class="mono">&lt;flags&gt;</span> is a comma-separated list, empty by default. Defined flags: <span class="mono">gz</span> = payload is gzipped (decompressed on receive; CRC is over the original bytes, filename is the original).</li>
+          <li><span class="mono">&lt;sizeBytes&gt;</span> is the on-wire size (gzipped size when <span class="mono">gz</span> is set); <span class="mono">&lt;crc32hex&gt;</span> is always over the original bytes.</li>
           <li>Base64 alphabet has no <span class="mono">|</span>, so parsing is just <span class="mono">split('|')</span>.</li>
           <li>Receiver tracks chunks by index, ignores duplicates, dedupes header by CRC.</li>
         </ul>
@@ -392,6 +394,9 @@
           <option value="Q">Q</option>
           <option value="H">H</option>
         </select>
+      </label>
+      <label title="Gzip the file before sending. Falls back to uncompressed automatically if gzipping would make the transfer larger (e.g. for already-compressed files like PDF, JPG, MP4).">
+        <input id="send-compress" type="checkbox"> Compress (gzip)
       </label>
     </div>
     <div class="row">
@@ -542,6 +547,26 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     var out = new Uint8Array(bin.length);
     for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
     return out;
+  }
+
+  // Native CompressionStream gzip — available in Chrome 80+, Firefox 113+, Safari 16.4+.
+  async function gzipBytes(bytes) {
+    var stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+    var buf = await new Response(stream).arrayBuffer();
+    return new Uint8Array(buf);
+  }
+  async function gunzipBytes(bytes) {
+    var stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+    var buf = await new Response(stream).arrayBuffer();
+    return new Uint8Array(buf);
+  }
+
+  // Flags this build understands. Receiver refuses to decode a header that
+  // names any flag outside this list, so it never hands a corrupt file to
+  // the user just because a future sender shipped something new.
+  var KNOWN_FLAGS = ['gz'];
+  function parseFlags(s) {
+    return (s || '').split(',').filter(function (t) { return t.length > 0; });
   }
 
   function renderQRToCanvas(text, ecc, cellSize, canvas) {
@@ -700,6 +725,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   var sendFps = document.getElementById('send-fps');
   var sendFpsVal = document.getElementById('send-fps-val');
   var sendEcc = document.getElementById('send-ecc');
+  var sendCompress = document.getElementById('send-compress');
   var sendStart = document.getElementById('send-start');
   var sendPause = document.getElementById('send-pause');
   var sendStop = document.getElementById('send-stop');
@@ -724,16 +750,43 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (sendTimer) { stopTicker(); startTicker(); }
   });
 
+  // Original file bytes + CRC are invariants once a file is picked. The
+  // on-wire payload (`loadedBytes` / `loadedB64`) can change as the user
+  // toggles compression, since the gzipped payload may or may not be smaller.
+  var loadedRawBytes = null;
   var loadedBytes = null;
   var loadedB64 = null;
   var loadedCrc = null;
+  var loadedFlags = '';
   var loadedName = null;
+
+  async function recomputeWire() {
+    if (!loadedRawBytes) return;
+    var payload = loadedRawBytes;
+    var flags = '';
+    if (sendCompress.checked) {
+      try {
+        var gz = await gzipBytes(loadedRawBytes);
+        if (gz.length < loadedRawBytes.length) {
+          payload = gz;
+          flags = 'gz';
+        }
+      } catch (e) {
+        sendError.textContent = 'Compression failed: ' + (e.message || e);
+        return;
+      }
+    }
+    loadedBytes = payload;
+    loadedB64 = bytesToBase64(payload);
+    loadedFlags = flags;
+    prepareFrames();
+  }
 
   function prepareFrames() {
     if (!loadedBytes) return;
     var chunkLen = Math.max(50, Math.min(2000, parseInt(sendChunk.value, 10) || 500));
     var totalData = Math.max(1, Math.ceil(loadedB64.length / chunkLen));
-    var header = 'QRX1|H|' + totalData + '|' + loadedName + '|' + loadedBytes.length + '|' + loadedCrc;
+    var header = 'QRX1|H|' + totalData + '|' + loadedFlags + '|' + loadedName + '|' + loadedBytes.length + '|' + loadedCrc;
     var frames = [header];
     for (var i = 0; i < totalData; i++) {
       frames.push('QRX1|D|' + (i + 1) + '|' + loadedB64.substring(i * chunkLen, (i + 1) * chunkLen));
@@ -742,7 +795,15 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     stopTicker();
     sendFrames = frames;
     sendIdx = 0;
-    sendInfo.textContent = loadedName + ' — ' + formatBytes(loadedBytes.length) +
+    var compressNote = '';
+    if (loadedFlags === 'gz') {
+      var pct = Math.round(100 * (1 - loadedBytes.length / loadedRawBytes.length));
+      compressNote = ' → ' + formatBytes(loadedBytes.length) + ' gzipped (' + pct + '% smaller)';
+    } else if (sendCompress.checked) {
+      compressNote = ' (gzip skipped — would have grown the payload)';
+    }
+    sendInfo.textContent = loadedName + ' — ' + formatBytes(loadedRawBytes.length) +
+      compressNote +
       ' — ' + totalData + ' data chunks (' + frames.length + ' total frames incl. header)' +
       ' — chunk ' + chunkLen + ' chars — CRC32 ' + loadedCrc;
     sendStart.disabled = false;
@@ -782,7 +843,8 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     sendShowBtn.disabled = true;
     sendShowPrev.disabled = true;
     sendShowNext.disabled = true;
-    loadedBytes = loadedB64 = loadedCrc = loadedName = null;
+    loadedRawBytes = loadedBytes = loadedB64 = loadedCrc = loadedName = null;
+    loadedFlags = '';
 
     var f = sendFile.files && sendFile.files[0];
     if (!f) return;
@@ -793,11 +855,10 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     };
     reader.onload = function () {
       try {
-        loadedBytes = new Uint8Array(reader.result);
-        loadedB64 = bytesToBase64(loadedBytes);
-        loadedCrc = crc32hex(loadedBytes);
+        loadedRawBytes = new Uint8Array(reader.result);
+        loadedCrc = crc32hex(loadedRawBytes);
         loadedName = f.name;
-        prepareFrames();
+        recomputeWire();
       } catch (e) {
         sendError.textContent = 'Failed to prepare: ' + (e.message || e);
       }
@@ -806,6 +867,7 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   });
 
   sendChunk.addEventListener('input', prepareFrames);
+  sendCompress.addEventListener('change', recomputeWire);
 
   function showSendFrame() {
     if (!sendFrames.length) return;
@@ -941,13 +1003,14 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
   function parseFrame(text) {
     if (text.indexOf('QRX1|') !== 0) return null;
     var parts = text.split('|');
-    if (parts[1] === 'H' && parts.length >= 6) {
+    if (parts[1] === 'H' && parts.length >= 7) {
       return {
         type: 'H',
         total: parseInt(parts[2], 10),
-        name: parts[3],
-        size: parseInt(parts[4], 10),
-        crc: (parts[5] || '').toLowerCase()
+        flags: parts[3],
+        name: parts[4],
+        size: parseInt(parts[5], 10),
+        crc: (parts[6] || '').toLowerCase()
       };
     }
     if (parts[1] === 'D' && parts.length >= 4) {
@@ -971,7 +1034,8 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
 
   function updateRecvDisplay() {
     if (!recvHeader) return;
-    recvInfo.textContent = recvHeader.name + ' — ' + formatBytes(recvHeader.size) +
+    var flagNote = recvHeader.flags ? ' [' + recvHeader.flags + ']' : '';
+    recvInfo.textContent = recvHeader.name + ' — ' + formatBytes(recvHeader.size) + flagNote +
       ' — ' + recvHeader.total + ' chunks — CRC32 ' + recvHeader.crc;
     recvBar.max = recvHeader.total;
     recvBar.value = recvCount;
@@ -989,6 +1053,12 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     if (!f) return;
     if (f.type === 'H') {
       if (recvHeader && recvHeader.crc === f.crc && recvChunks && recvChunks.length === f.total) {
+        return;
+      }
+      var unknown = parseFlags(f.flags).filter(function (x) { return KNOWN_FLAGS.indexOf(x) < 0; });
+      if (unknown.length) {
+        recvError.textContent = 'Unknown header flags: ' + unknown.join(',') +
+          ' — this build knows only: ' + KNOWN_FLAGS.join(',');
         return;
       }
       recvHeader = f;
@@ -1013,12 +1083,22 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
     }
   }
 
-  function finalizeRecv() {
+  async function finalizeRecv() {
     recvDone = true;
     try {
       var b64 = recvChunks.join('');
-      var bytes = base64ToBytes(b64);
-      var sizeMatch = bytes.length === recvHeader.size;
+      var payload = base64ToBytes(b64);
+      var sizeMatch = payload.length === recvHeader.size;
+      var flags = parseFlags(recvHeader.flags);
+      var bytes = payload;
+      if (flags.indexOf('gz') >= 0) {
+        try {
+          bytes = await gunzipBytes(payload);
+        } catch (e) {
+          recvError.textContent = 'Gzip decompression failed: ' + (e.message || e);
+          return;
+        }
+      }
       var gotCrc = crc32hex(bytes);
       var crcOk = gotCrc === recvHeader.crc;
       var blob = new Blob([bytes]);
@@ -1034,11 +1114,14 @@ var qrcode=function(){var t=function(t,r){var e=t,n=g[r],o=null,i=0,a=null,u=[],
 
       var status = document.createElement('span');
       if (crcOk && sizeMatch) {
-        status.textContent = 'OK — CRC matches.';
+        var note = (flags.indexOf('gz') >= 0)
+          ? ' (' + formatBytes(payload.length) + ' wire → ' + formatBytes(bytes.length) + ' decompressed)'
+          : '';
+        status.textContent = 'OK — CRC matches.' + note;
         status.style.color = '#1a8030';
       } else {
         var msg = [];
-        if (!sizeMatch) msg.push('size ' + bytes.length + ' vs expected ' + recvHeader.size);
+        if (!sizeMatch) msg.push('wire size ' + payload.length + ' vs expected ' + recvHeader.size);
         if (!crcOk) msg.push('CRC ' + gotCrc + ' vs expected ' + recvHeader.crc);
         status.textContent = 'Mismatch — ' + msg.join('; ');
         status.style.color = '#c00';
