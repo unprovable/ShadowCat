@@ -1,6 +1,6 @@
 # ShadowCat
 
-A fully offline, single-file HTML page for moving data between two devices via QR codes — intended for old phones whose radios (BLE, NFC, etc.) arevdead but whose cameras and browsers still work.
+A fully offline, single-file HTML page for moving data between two devices via QR codes — intended for old phones whose radios (BLE, NFC, etc.) are dead but whose cameras and browsers still work.
 
 ## Tabs
 
